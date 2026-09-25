@@ -1,0 +1,845 @@
+%% TrustAware_Adaptive_FL_UAV_RIS_V4_3.m
+% Paper-oriented V4.3 simulation for:
+% Trust-Aware Adaptive Federated Learning Under Non-IID and Time-Varying
+% Channels for Energy-Efficient UAV-RIS-Assisted 6G Networks
+% MATLAB R2024a | No Communications/Deep Learning Toolbox required.
+%
+% V4.3 corrections:
+% 1) Attacker ground truth is used ONLY for attack generation/evaluation,
+%    never for trust, reliability, anomaly detection, or aggregation.
+% 2) Local accuracy is computed separately for every FL method.
+% 3) Identical local mini-batches are reused across all methods.
+% 4) Convergence requires 5 consecutive rounds above 95% of final accuracy.
+% 5) The same physical/data realization is reused across attack fractions
+%    within each Monte-Carlo run for a paired and fair robustness study.
+% 6) RIS model is channel-dependent: BS-RIS and RIS-UAV/user channels are
+%    explicitly generated and a quantized phase vector is optimized against
+%    a cascaded channel objective. This remains a lightweight toolbox-free
+%    RIS model, not a full multi-user beamforming solver.
+% 7) Complete local-accuracy history is retained for every MC/scenario.
+% 8) Energy model remains an explicit simplified/normalized model.
+%
+% Methods:
+% 1 FedAvg
+% 2 Trust-FL
+% 3 Trust+Channel
+% 4 Trust+Channel+Energy
+% 5 Full Proposed
+%
+% Scenarios: 0,10,20,30% malicious UAVs; strong non-IID; mobility;
+% temporally correlated CSI; 8 Monte-Carlo runs.
+%
+% Outputs: CSV summary/ablation/20%-attack round results, MAT results,
+% and publication-oriented figures.
+
+clear; clc; close all; rng(1357,'twister');
+
+%% Parameters
+P.NUAV=10; P.NUSER=100; P.NRIS=128; P.NFEAT=8; P.LOCALN=300;
+P.ROUNDS=80; P.LOCAL_EPOCHS=3; P.BATCH=32; P.MC=8;
+P.attackFractions=[0 0.10 0.20 0.30];
+
+P.fc=28e9; P.BW=100e6; P.Ptx_dBm=30; P.noise_dBm=-94;
+P.area=[500 500]; P.uavHeight=100; P.maxSpeed=8;
+P.rhoCSI=0.965; P.mobilityRho=0.90; P.mobilityNoise=0.045;
+
+P.lr=0.030; P.l2=1e-3;
+P.initialEnergy=100; P.Etx_per_round=0.35; P.Ecomp_base=0.25;
+P.Emove_factor=0.008; P.Eris_per_round=0.025;
+
+P.trustMemory=0.90;
+P.lambdaTrust=0.30; P.lambdaChannel=0.20; P.lambdaAccuracy=0.15;
+P.lambdaEnergy=0.15; P.lambdaData=0.10; P.lambdaReliability=0.10;
+P.attackMagnitude=4.0; P.attackNoise=0.15;
+P.attackDetectionThreshold=2.5;
+
+% RIS parameters
+P.risBits=2;                       % 2-bit phase quantization
+P.risCandidatePhases=(0:3)*(2*pi/4);
+P.risCoordinateIterations=2;       % lightweight coordinate optimization
+P.risOptimizeElements=32;          % optimize subset each round
+P.risDirectWeight=0.20;            % direct path contribution
+P.risPathScale=0.18;               % normalized cascaded-path scale
+P.risCorrelation=0.94;              % temporal correlation of RIS channels
+
+methods={'FedAvg','Trust-FL','Trust+Channel','Trust+Channel+Energy',...
+         'Full Proposed'};
+nM=numel(methods); nS=numel(P.attackFractions);
+
+FinalAcc=zeros(P.MC,nS,nM); FinalEnergy=zeros(P.MC,nS);
+FinalTrust=zeros(P.MC,nS); FinalMalWeight=zeros(P.MC,nS);
+FinalSumRate=zeros(P.MC,nS); FinalEE=zeros(P.MC,nS);
+MeanCSIvariation=zeros(P.MC,nS); CommBits=zeros(P.MC,nS);
+ConvRound=zeros(P.MC,nS,nM);
+
+traceAcc=zeros(P.MC,P.ROUNDS,nM); traceEnergy=zeros(P.MC,P.ROUNDS);
+traceTrust=zeros(P.MC,P.ROUNDS); traceMalWeight=zeros(P.MC,P.ROUNDS);
+traceSumRate=zeros(P.MC,P.ROUNDS); traceEE=zeros(P.MC,P.ROUNDS);
+traceCSI=zeros(P.MC,P.ROUNDS);
+traceCommBits=zeros(P.MC,P.ROUNDS);
+
+% Complete local-accuracy history: MC x scenario x round x UAV x method
+localAccuracyHistoryAll=zeros(P.MC,nS,P.ROUNDS,P.NUAV,nM);
+
+fprintf('V4.3 simulation: %d UAVs, %d RIS elements, %d rounds, %d MC runs\n',...
+    P.NUAV,P.NRIS,P.ROUNDS,P.MC);
+
+%% Main experiments
+% MC is the outer loop so each attack scenario can use the SAME underlying
+% data, mobility, CSI process, and model initialization for paired comparison.
+for mc=1:P.MC
+    fprintf('\n================ MC RUN %d/%d ================\n',mc,P.MC);
+    rng(100000+mc,'twister');
+
+    %% Generate one common data realization for this MC run
+    classBias=[0.02 0.05 0.10 0.15 0.25 0.75 0.85 0.90 0.95 0.98];
+    X=cell(P.NUAV,1); Y=cell(P.NUAV,1); dataQuality=zeros(P.NUAV,1);
+    wTrue=randn(P.NFEAT,1)*0.75; bTrue=-0.10;
+
+    for i=1:P.NUAV
+        X{i}=randn(P.LOCALN,P.NFEAT);
+        X{i}(:,1:3)=X{i}(:,1:3)+0.35*(i-P.NUAV/2)/P.NUAV;
+        baseProb=sigmoid(X{i}*wTrue+bTrue);
+        localProb=min(max(0.30*baseProb+0.70*classBias(i),0.01),0.99);
+        Y{i}=double(rand(P.LOCALN,1)<localProb);
+        balance=1-2*abs(mean(Y{i})-0.5);
+        dataQuality(i)=max(0.05,0.45+0.55*balance);
+    end
+
+    Xtest=randn(4000,P.NFEAT);
+    Ytest=double(sigmoid(Xtest*wTrue+bTrue)>=0.5);
+
+    % Common initial global model for all attack scenarios in this MC run.
+    W0=zeros(P.NFEAT+1,nM);
+    W0(1:P.NFEAT,:)=repmat(0.05*randn(P.NFEAT,1),1,nM);
+
+    %% Common initial wireless realization for this MC run
+    pos0=[rand(P.NUAV,1)*P.area(1),rand(P.NUAV,1)*P.area(2)];
+    velocity0=zeros(P.NUAV,2);
+    H0=(randn(P.NUAV,P.NUSER)+1j*randn(P.NUAV,P.NUSER))/sqrt(2);
+
+    % BS-RIS channel and RIS-UAV/user channels for a channel-dependent RIS model.
+    G0=(randn(P.NRIS,1)+1j*randn(P.NRIS,1))/sqrt(2);
+    HRU0=(randn(P.NUAV,P.NRIS,P.NUSER)+1j*...
+          randn(P.NUAV,P.NRIS,P.NUSER))/sqrt(2);
+
+    % Common random stream for paired attack scenarios. All physical channel
+    % trajectories are generated once per MC and then reused for every scenario.
+    rng(200000+mc,'twister');
+    mobilityNoiseAll=P.mobilityNoise*randn(P.ROUNDS,P.NUAV,2);
+    csiInnovationAll=(randn(P.ROUNDS,P.NUAV,P.NUSER)+1j*...
+                      randn(P.ROUNDS,P.NUAV,P.NUSER))/sqrt(2);
+    risInnovationAll=(randn(P.ROUNDS,P.NUAV,P.NRIS,P.NUSER)+1j*...
+                      randn(P.ROUNDS,P.NUAV,P.NRIS,P.NUSER))/sqrt(2);
+    gInnovationAll=(randn(P.ROUNDS,P.NRIS,1)+1j*...
+                    randn(P.ROUNDS,P.NRIS,1))/sqrt(2);
+
+    % Fixed attacker identities across all attack fractions for this MC run.
+    rng(300000+mc,'twister');
+    attackerOrder=randperm(P.NUAV);
+
+    % Common mini-batch indices across all attack scenarios and methods.
+    batchIdxAll=cell(P.ROUNDS,P.NUAV,P.LOCAL_EPOCHS);
+    for t0=1:P.ROUNDS
+        for i0=1:P.NUAV
+            for ep0=1:P.LOCAL_EPOCHS
+                batchIdxAll{t0,i0,ep0}=randperm(P.LOCALN,min(P.BATCH,P.LOCALN));
+            end
+        end
+    end
+
+    for si=1:nS
+        attackFrac=P.attackFractions(si);
+        fprintf('\nAttack fraction = %.0f%%\n',100*attackFrac);
+
+        % Recreate the common initial state exactly for this scenario.
+        pos=pos0; velocity=velocity0; H=H0;
+        G=G0; HRU=HRU0;
+
+        nAttack=round(attackFrac*P.NUAV);
+        attackers=attackerOrder(1:nAttack);
+        isMalicious=false(P.NUAV,1); isMalicious(attackers)=true;
+
+        W=W0;
+        energy=P.initialEnergy*ones(P.NUAV,1);
+        trust=0.80*ones(P.NUAV,1);
+        reliability=0.90*ones(P.NUAV,1);
+        historyAccuracy=0.70*ones(P.NUAV,1);
+
+        roundAcc=zeros(P.ROUNDS,nM); roundEnergy=zeros(P.ROUNDS,1);
+        roundTrust=zeros(P.ROUNDS,1); roundMalWeight=zeros(P.ROUNDS,1);
+        localAccuracyHistory=zeros(P.ROUNDS,P.NUAV,nM);
+        roundRate=zeros(P.ROUNDS,1); roundEE=zeros(P.ROUNDS,1);
+        roundCSI=zeros(P.ROUNDS,1);
+
+
+        % RIS comparison rate histories
+        rateDirect = zeros(P.ROUNDS,1);
+        rateRandomRIS = zeros(P.ROUNDS,1);
+        rateOptimizedRIS = zeros(P.ROUNDS,1);
+
+        for t=1:P.ROUNDS
+            %% Gauss-Markov UAV mobility using common innovations
+            velocity=P.mobilityRho*velocity + squeeze(mobilityNoiseAll(t,:,:));
+            speed=sqrt(sum(velocity.^2,2));
+            fast=speed>P.maxSpeed;
+            if any(fast), velocity(fast,:)=velocity(fast,:).*(P.maxSpeed./speed(fast)); end
+            speed=sqrt(sum(velocity.^2,2));
+            pos=pos+velocity;
+            pos(:,1)=min(max(pos(:,1),0),P.area(1));
+            pos(:,2)=min(max(pos(:,2),0),P.area(2));
+
+            %% Time-correlated direct CSI
+            Hnew=P.rhoCSI*H+sqrt(1-P.rhoCSI^2)*squeeze(csiInnovationAll(t,:,:));
+            csiVariation=mean(abs(Hnew(:)-H(:)).^2)/(mean(abs(H(:)).^2)+eps);
+            Hprev=H; H=Hnew;
+
+            channelPower=mean(abs(H).^2,2);
+            channelQuality=channelPower./(channelPower+1);
+            channelChange=zeros(P.NUAV,1); channelStability=zeros(P.NUAV,1);
+            for i=1:P.NUAV
+                channelChange(i)=mean(abs(H(i,:)-Hprev(i,:)).^2)/...
+                    (mean(abs(Hprev(i,:)).^2)+eps);
+                channelStability(i)=exp(-5*channelChange(i));
+            end
+
+           %% Time-correlated BS-RIS and RIS-UAV/user channels
+
+% BS-RIS channel:
+% G is NRIS x 1
+gInnov = reshape(gInnovationAll(t,:,:), size(G));
+
+Gnew = P.risCorrelation * G + ...
+       sqrt(1 - P.risCorrelation^2) * gInnov;
+
+G = Gnew;
+
+
+% RIS-UAV/user channel:
+% HRU is NUAV x NRIS x NUSER
+risInnov = reshape(risInnovationAll(t,:,:), size(HRU));
+
+HRUnew = P.risCorrelation * HRU + ...
+         sqrt(1 - P.risCorrelation^2) * risInnov;
+
+HRU = HRUnew;
+
+
+%% Channel-dependent quantized RIS optimization
+[risGain, risEffectivePower, risPhase] = ...
+    optimizeRISChannel(H, G, HRU, P);
+
+            %% Local FL training
+            localModels=zeros(P.NFEAT+1,P.NUAV,nM);
+
+            % Reuse the same pre-generated mini-batches for every attack
+            % scenario, UAV, method, and corresponding communication round.
+            % This makes the robustness comparison paired and reproducible.
+
+            % Same initial global models across methods; local optimization
+            % then differs only through the method-specific global model.
+            for i=1:P.NUAV
+                for m=1:nM
+                    theta=W(:,m);
+                    for ep=1:P.LOCAL_EPOCHS
+                        idx=batchIdxAll{t,i,ep};
+                        xb=X{i}(idx,:); yb=Y{i}(idx);
+                        pred=sigmoid(xb*theta(1:P.NFEAT)+theta(end));
+                        err=pred-yb;
+                        gw=xb'*err/numel(idx)+P.l2*theta(1:P.NFEAT);
+                        theta(1:P.NFEAT)=theta(1:P.NFEAT)-P.lr*gw;
+                        theta(end)=theta(end)-P.lr*mean(err);
+                    end
+                    if isMalicious(i)
+                        theta=-P.attackMagnitude*theta+P.attackNoise*randn(size(theta));
+                    end
+                    localModels(:,i,m)=theta;
+                end
+            end
+
+            %% Method-specific local accuracy after local update
+            localAccAll=zeros(P.NUAV,nM);
+            for m=1:nM
+                for i=1:P.NUAV
+                    th=localModels(:,i,m);
+                    localAccAll(i,m)=mean((sigmoid(X{i}*th(1:P.NFEAT)+th(end))>=0.5)==Y{i});
+                end
+            end
+            localAccuracyHistory(t,:,:)=localAccAll;
+
+            %% Observable trust/reliability estimation
+            % IMPORTANT: isMalicious is not used anywhere in this block.
+            medianModel=median(localModels(:,:,nM),2);
+            modelDistance=sqrt(sum((localModels(:,:,nM)-medianModel).^2,1))';
+            modelConsistency=exp(-modelDistance);
+
+            reliability=0.90*reliability+0.10*(...
+                0.50*channelQuality+0.50*modelConsistency);
+            reliability=min(max(reliability,0.01),1);
+
+            anomalyScore=1./(1+modelDistance);
+            behavior=localAccAll(:,nM);
+
+            trustTarget=0.30*behavior+0.25*channelStability+0.20*reliability+...
+                        0.15*historyAccuracy+0.10*anomalyScore;
+            trust=P.trustMemory*trust+(1-P.trustMemory)*trustTarget;
+            trust=min(max(trust,0.01),1);
+            historyAccuracy=0.94*historyAccuracy+0.06*behavior;
+
+            q=normalize01(channelQuality);
+            % Full Proposed uses its own method-specific local accuracy.
+            a=normalize01(localAccAll(:,nM));
+            e=normalize01(energy/P.initialEnergy);
+            d=normalize01(dataQuality);
+            r=normalize01(reliability);
+            tr=normalize01(trust);
+
+            %% Adaptive aggregation / ablation
+            for m=1:nM
+                switch m
+                    case 1
+                        score=ones(P.NUAV,1);
+                    case 2
+                        score=0.20+0.80*tr;
+                    case 3
+                        score=(0.20+0.80*tr).*(0.25+0.75*q);
+                    case 4
+                        score=(0.20+0.80*tr).*(0.25+0.75*q).*(0.30+0.70*e);
+                    case 5
+                        score=(0.20+0.80*tr).^P.lambdaTrust.*...
+                              (0.20+0.80*q).^P.lambdaChannel.*...
+                              (0.20+0.80*a).^P.lambdaAccuracy.*...
+                              (0.20+0.80*e).^P.lambdaEnergy.*...
+                              (0.20+0.80*d).^P.lambdaData.*...
+                              (0.20+0.80*r).^P.lambdaReliability;
+
+                        % Robust, label-free anomaly gating.
+                        medDist=median(modelDistance);
+                        madDist=median(abs(modelDistance-medDist))+eps;
+                        robustZ=abs(modelDistance-medDist)/(1.4826*madDist);
+                        gate=ones(P.NUAV,1);
+                        gate(robustZ>P.attackDetectionThreshold)=0.03;
+                        gate(trust<0.18)=0.02;
+                        score=score.*gate;
+                end
+
+                score=max(score,1e-10);
+                alpha=score/sum(score);
+                W(:,m)=localModels(:,:,m)*alpha;
+
+                ztest=Xtest*W(1:P.NFEAT,m)+W(end,m);
+                roundAcc(t,m)=mean((sigmoid(ztest)>=0.5)==Ytest);
+
+                % Ground truth is used ONLY for this evaluation metric.
+                if m==nM
+                    roundMalWeight(t)=sum(alpha(isMalicious));
+                end
+            end
+
+        %% Geometry-aware wireless model with cascaded RIS proxy
+
+dist2D=sqrt((pos(:,1)-P.area(1)/2).^2 + ...
+    (pos(:,2)-P.area(2)/2).^2);
+
+distance3D=sqrt(dist2D.^2 + P.uavHeight^2);
+
+lambda=3e8/P.fc;
+
+% Free-space path-loss component
+fsGain=(lambda./(4*pi*max(distance3D,1))).^2;
+
+% Direct channel contribution
+directGain=channelPower.*fsGain;
+
+% Channel-dependent optimized RIS contribution
+risGainPerUAV=max(risEffectivePower,eps);
+
+% Observable communication reliability factor
+reliabilityGain=0.75+0.25*reliability;
+
+% Observable channel-quality factor
+csiGain=0.85+0.30*channelQuality;
+
+% ============================================================
+% TRANSMIT POWER AND NOISE
+% ============================================================
+
+noiseW=10.^((P.noise_dBm-30)/10);
+txW=10.^((P.Ptx_dBm-30)/10);
+
+% ============================================================
+% 1. DIRECT TRANSMISSION - NO RIS
+% ============================================================
+
+effectiveGainDirect= ...
+    directGain .* reliabilityGain .* csiGain;
+
+snrDirect=txW.*effectiveGainDirect./(noiseW+eps);
+
+rateDirect(t)=sum( ...
+    P.BW.*log2(1+snrDirect) ...
+    )/1e9;
+
+
+% ============================================================
+% 2. RANDOM RIS
+% ============================================================
+
+randomPhi=P.risCandidatePhases( ...
+    randi(numel(P.risCandidatePhases),P.NRIS,1));
+
+vRandom=G(:).*exp(1j*randomPhi(:));
+
+randomRISPower=zeros(P.NUAV,1);
+
+for i=1:P.NUAV
+
+    HR=squeeze(HRU(i,:,:));
+
+    cascRandom=vRandom.'*HR;
+
+    fieldRandom= ...
+        P.risDirectWeight*H(i,:) + ...
+        P.risPathScale*cascRandom;
+
+    randomRISPower(i)=mean(abs(fieldRandom).^2);
+
+end
+
+effectiveGainRandomRIS= ...
+    channelPower.*fsGain.*P.risDirectWeight + ...
+    P.risPathScale.*randomRISPower.*fsGain;
+
+effectiveGainRandomRIS= ...
+    effectiveGainRandomRIS.*reliabilityGain.*csiGain;
+
+snrRandomRIS= ...
+    txW.*effectiveGainRandomRIS./(noiseW+eps);
+
+rateRandomRIS(t)=sum( ...
+    P.BW.*log2(1+snrRandomRIS) ...
+    )/1e9;
+
+
+% ============================================================
+% 3. OPTIMIZED RIS
+% ============================================================
+
+effectiveGainOptimizedRIS= ...
+    directGain.*P.risDirectWeight + ...
+    P.risPathScale.*risGainPerUAV.*fsGain;
+
+effectiveGainOptimizedRIS= ...
+    effectiveGainOptimizedRIS.*reliabilityGain.*csiGain;
+
+snrOptimizedRIS= ...
+    txW.*effectiveGainOptimizedRIS./(noiseW+eps);
+
+rateOptimizedRIS(t)=sum( ...
+    P.BW.*log2(1+snrOptimizedRIS) ...
+    )/1e9;
+
+
+% ============================================================
+% MAIN PROPOSED NETWORK SUM RATE
+% ============================================================
+
+roundRate(t)=rateOptimizedRIS(t);
+%% Energy model
+% UAV energy consumption with explicit dependence on:
+% transmission quality, computation/load, mobility, RIS operation,
+% and reliability. This produces a clearer energy trend across rounds.
+
+% 1. Mobility energy
+moveEnergyPerUAV = P.Emove_factor * (speed.^2);
+
+% 2. Transmission energy
+% Poor channel quality and lower reliability require more effective
+% communication effort.
+txFactor = 1.15 - 0.45*channelQuality;
+relFactor = 1.10 - 0.20*reliability;
+
+txEnergyPerUAV = P.Etx_per_round .* txFactor .* relFactor;
+
+% 3. Computation energy
+% UAVs with larger local workload / lower local accuracy consume
+% somewhat more computation energy.
+accuracyFactor = 1.10 - 0.30*localAccAll(:,nM);
+
+compEnergyPerUAV = P.Ecomp_base .* accuracyFactor;
+
+% 4. RIS energy
+% RIS operation depends on the number of active elements and
+% channel-dependent RIS gain.
+risFactor = 0.80 + 0.40*risGain;
+
+risEnergyPerUAV = P.Eris_per_round * ...
+    (P.NRIS/128) * risFactor * ones(P.NUAV,1);
+
+% 5. Reliability penalty
+% Less reliable communication causes additional energy expenditure.
+reliabilityPenalty = 1.00 + 0.35*(1-reliability);
+
+% 6. Total per-UAV energy consumption for this round
+energyStepPerUAV = ...
+    (txEnergyPerUAV + ...
+     compEnergyPerUAV + ...
+     moveEnergyPerUAV + ...
+     risEnergyPerUAV) .* reliabilityPenalty;
+
+% 7. Small stochastic hardware/air-interface variation
+randomFactor = 0.90 + 0.20*rand(P.NUAV,1);
+
+energyStepPerUAV = energyStepPerUAV .* randomFactor;
+
+% 8. Update remaining battery energy
+energy = max(0.1, energy - energyStepPerUAV);
+
+% 9. Store mean remaining energy
+roundEnergy(t) = mean(energy);
+
+% 10. Store mean trust
+roundTrust(t) = mean(trust);
+
+% 11. Energy efficiency
+totalEnergyThisRound = mean(energyStepPerUAV);
+
+roundEE(t) = roundRate(t) / ...
+    (totalEnergyThisRound + eps);
+
+% 12. Time-varying CSI
+roundCSI(t) = csiVariation;
+
+% All UAVs participate in every FL round, so communication volume
+% remains independent of attack fraction.
+CommBits(mc,si) = CommBits(mc,si) + ...
+    2*P.NUAV*32*(P.NFEAT+1);
+        end
+
+        %% Final metrics
+        tail=max(1,P.ROUNDS-9):P.ROUNDS;
+        FinalAcc(mc,si,:)=mean(roundAcc(tail,:),1);
+        FinalEnergy(mc,si)=mean(roundEnergy(tail));
+        FinalTrust(mc,si)=mean(roundTrust(tail));
+        FinalMalWeight(mc,si)=mean(roundMalWeight(tail));
+        FinalSumRate(mc,si)=mean(roundRate(tail));
+        FinalEE(mc,si)=mean(roundEE(tail));
+        MeanCSIvariation(mc,si)=mean(roundCSI);
+        localAccuracyHistoryAll(mc,si,:,:,:)=localAccuracyHistory;
+
+        %% Relative convergence: 5 consecutive rounds above 95% of final
+        for m=1:nM
+            target=0.95*FinalAcc(mc,si,m);
+            hit=P.ROUNDS;
+            for rr=1:(P.ROUNDS-4)
+                if all(roundAcc(rr:rr+4,m)>=target)
+                    hit=rr;
+                    break;
+                end
+            end
+            ConvRound(mc,si,m)=hit;
+        end
+
+        if abs(attackFrac-0.20)<eps
+            traceAcc(mc,:,:)=roundAcc;
+            traceEnergy(mc,:)=roundEnergy;
+            traceTrust(mc,:)=roundTrust;
+            traceMalWeight(mc,:)=roundMalWeight;
+            traceSumRate(mc,:)=roundRate;
+            traceEE(mc,:)=roundEE;
+            traceCSI(mc,:)=roundCSI;
+            commPerRound = 2*P.NUAV*32*(P.NFEAT+1);
+            traceCommBits(mc,:) = commPerRound;
+
+
+        end
+
+        fprintf('MC %d/%d final accuracy: ',mc,P.MC);
+        fprintf('%.2f ',100*squeeze(FinalAcc(mc,si,:))); fprintf('%%\n');
+    end
+end
+
+%% Summary
+meanAcc=squeeze(mean(FinalAcc,1)); stdAcc=squeeze(std(FinalAcc,0,1));
+
+fprintf('\n================ FINAL SUMMARY ================\n');
+for si=1:nS
+    fprintf('\nAttack %.0f%%\n',100*P.attackFractions(si));
+    for m=1:nM
+        fprintf('%-25s %.2f +/- %.2f %%\n',methods{m},...
+            100*meanAcc(si,m),100*stdAcc(si,m));
+    end
+    fprintf('Energy %.3f J | Trust %.4f | MalWeight %.4f | Rate %.4f Gbit/s | EE %.4f | CSI %.5f\n',...
+        mean(FinalEnergy(:,si)),mean(FinalTrust(:,si)),...
+        mean(FinalMalWeight(:,si)),mean(FinalSumRate(:,si)),...
+        mean(FinalEE(:,si)),mean(MeanCSIvariation(:,si)));
+end
+
+%% CSV: full summary
+rows=[];
+for si=1:nS
+    for m=1:nM
+        rows=[rows;100*P.attackFractions(si),m,100*meanAcc(si,m),...
+            100*stdAcc(si,m),mean(FinalEnergy(:,si)),mean(FinalTrust(:,si)),...
+            mean(FinalMalWeight(:,si)),mean(FinalSumRate(:,si)),...
+            mean(FinalEE(:,si)),mean(MeanCSIvariation(:,si)),...
+            mean(ConvRound(:,si,m)),mean(CommBits(:,si))]; %#ok<AGROW>
+    end
+end
+SummaryTable=array2table(rows,'VariableNames',...
+ {'AttackPercent','MethodID','AccuracyMeanPercent','AccuracyStdPercent',...
+ 'RemainingEnergyJ','MeanTrust','MaliciousAggregationWeight',...
+ 'SumRateGbitPerSec','EnergyEfficiency','CSIvariation',...
+ 'ConvergenceRound','CommunicationBits'});
+
+% Add method names to SummaryTable
+methodNames = methods(SummaryTable.MethodID);
+methodNames = methodNames(:);
+
+SummaryTable.Method = methodNames;
+
+SummaryTable = movevars(SummaryTable,'Method','After','MethodID');
+
+writetable(SummaryTable,'V4_3_summary.csv');
+
+%% CSV: ablation at 20%
+si20=find(abs(P.attackFractions-0.20)<eps,1);
+ab=zeros(nM,7);
+for m=1:nM
+    ab(m,:)=[m,100*meanAcc(si20,m),100*stdAcc(si20,m),...
+        mean(FinalEnergy(:,si20)),mean(FinalTrust(:,si20)),...
+        mean(FinalMalWeight(:,si20)),mean(ConvRound(:,si20,m))];
+end
+AblationTable = array2table(ab, ...
+    'VariableNames', ...
+    {'MethodID','AccuracyMeanPercent','AccuracyStdPercent', ...
+     'RemainingEnergyJ','MeanTrust','MaliciousWeight','ConvergenceRound'});
+
+methodNames = methods(AblationTable.MethodID);
+methodNames = methodNames(:);
+
+if numel(methodNames) ~= height(AblationTable)
+    error('Number of method names (%d) does not match AblationTable rows (%d).', ...
+        numel(methodNames), height(AblationTable));
+end
+
+AblationTable.Method = methodNames;
+AblationTable = movevars(AblationTable,'Method','After','MethodID');
+
+writetable(AblationTable,'V4_3_ablation.csv');
+%% CSV: 20% round traces
+rr=[];
+for mc=1:P.MC
+    for t=1:P.ROUNDS
+        rr=[rr;mc,t,squeeze(traceAcc(mc,t,:))',traceEnergy(mc,t),...
+            traceTrust(mc,t),traceMalWeight(mc,t),traceSumRate(mc,t),...
+            traceEE(mc,t),traceCSI(mc,t)]; %#ok<AGROW>
+    end
+end
+RoundTable=array2table(rr,'VariableNames',...
+ [{'MC','Round'},strcat('Accuracy_',methods),...
+ {'RemainingEnergyJ','MeanTrust','MaliciousWeight','SumRateGbitPerSec',...
+ 'EnergyEfficiency','CSIvariation'}]);
+writetable(RoundTable,'V4_3_round_results_20attack.csv');
+
+%% Figures
+mu=squeeze(mean(traceAcc,1)); sd=squeeze(std(traceAcc,0,1));
+
+figure('Color','w'); hold on;
+for m=1:nM
+    errorbar(1:P.ROUNDS,100*mu(:,m),100*sd(:,m),...
+        'LineWidth',1.4,'DisplayName',methods{m});
+end
+grid on; box on; xlabel('Communication Round'); ylabel('Accuracy (%)');
+title('Convergence under 20% Malicious UAVs'); legend('Location','southeast');
+
+figure('Color','w'); hold on;
+for m=1:nM
+    errorbar(100*P.attackFractions,100*meanAcc(:,m),100*stdAcc(:,m),...
+        'o-','LineWidth',1.4,'DisplayName',methods{m});
+end
+grid on; box on; xlabel('Malicious UAVs (%)'); ylabel('Final Accuracy (%)');
+title('Robustness to Malicious UAVs'); legend('Location','southwest');
+
+figure('Color','w');
+bar(100*meanAcc(si20,:)); hold on;
+errorbar(1:nM,100*meanAcc(si20,:),100*stdAcc(si20,:),'.','LineWidth',1.5);
+grid on; box on; ylabel('Final Accuracy (%)'); xlabel('Aggregation Method');
+title('Ablation Study at 20% Malicious UAVs');
+set(gca,'XTick',1:nM,'XTickLabel',methods,'XTickLabelRotation',25);
+
+figure('Color','w');
+errorbar(100*P.attackFractions,mean(FinalMalWeight,1),...
+    std(FinalMalWeight,0,1),'o-','LineWidth',1.5); hold on;
+plot(100*P.attackFractions,P.attackFractions,'--','LineWidth',1.1);
+grid on; box on; xlabel('Malicious UAVs (%)'); ylabel('Malicious Weight');
+title('Suppression of Malicious UAV Contributions');
+legend('Observed','Client fraction','Location','northwest');
+
+figure('Color','w');
+errorbar(100*P.attackFractions,mean(FinalEnergy,1),...
+    std(FinalEnergy,0,1),'o-','LineWidth',1.5);
+grid on; box on; xlabel('Malicious UAVs (%)'); ylabel('Remaining Energy (J)');
+title('UAV Energy Sustainability');
+
+figure('Color','w');
+errorbar(100*P.attackFractions,mean(FinalSumRate,1),...
+    std(FinalSumRate,0,1),'o-','LineWidth',1.5);
+grid on; box on; xlabel('Malicious UAVs (%)'); ylabel('Sum Rate (Gbit/s)');
+title('Channel-Dependent RIS-Assisted Sum Rate');
+
+figure('Color','w');
+errorbar(100*P.attackFractions,mean(FinalEE,1),...
+    std(FinalEE,0,1),'o-','LineWidth',1.5);
+grid on; box on; xlabel('Malicious UAVs (%)'); ylabel('Energy Efficiency (scaled)');
+title('Energy Efficiency');
+
+figure('Color','w');
+errorbar(100*P.attackFractions,mean(MeanCSIvariation,1),...
+    std(MeanCSIvariation,0,1),'o-','LineWidth',1.5);
+grid on; box on; xlabel('Malicious UAVs (%)'); ylabel('Normalized CSI Variation');
+title('Time-Varying CSI');
+
+%% Figure 9: Cumulative Communication Overhead
+meanCommPerRound = mean(traceCommBits,1);
+cumulativeComm = cumsum(meanCommPerRound)/1e6;
+
+figure('Color','w');
+plot(1:P.ROUNDS,cumulativeComm,'o-','LineWidth',1.5);
+grid on; box on;
+xlabel('Communication Round');
+ylabel('Cumulative Communication Overhead (Mbit)');
+title('Cumulative Federated Communication Overhead at 20% Malicious UAVs');
+xlim([1 P.ROUNDS]);
+
+meanConv=squeeze(mean(ConvRound,1));
+stdConv=squeeze(std(ConvRound,0,1));
+
+figure('Color','w'); hold on;
+
+for m=1:nM
+    lowerErr = min(stdConv(:,m),meanConv(:,m));
+    upperErr = stdConv(:,m);
+
+    errorbar(100*P.attackFractions, ...
+        meanConv(:,m), ...
+        lowerErr, ...
+        upperErr, ...
+        'o-', ...
+        'LineWidth',1.3, ...
+        'DisplayName',methods{m});
+end
+
+grid on; box on;
+xlabel('Malicious UAVs (%)');
+ylabel('Convergence Round');
+title('Convergence Speed');
+legend('Location','northwest');
+
+ylim([0 P.ROUNDS]);
+xlim([0 30]);
+
+%% MAT file
+save('V4_3_results.mat','P','methods','FinalAcc','FinalEnergy','FinalTrust',...
+ 'FinalMalWeight','FinalSumRate','FinalEE','MeanCSIvariation','CommBits',...
+ 'ConvRound','traceAcc','traceEnergy','traceTrust','traceMalWeight',...
+ 'traceSumRate','traceEE','traceCSI','localAccuracyHistoryAll',...
+ 'SummaryTable','AblationTable','RoundTable');
+
+fprintf('\nV4.3 COMPLETE. Files saved:\n');
+fprintf('V4_3_summary.csv\nV4_3_ablation.csv\nV4_3_round_results_20attack.csv\nV4_3_results.mat\n');
+
+%% Local functions
+function y=sigmoid(x)
+x=max(min(x,35),-35); y=1./(1+exp(-x));
+end
+
+function y=normalize01(x)
+xmin=min(x); xmax=max(x);
+if xmax-xmin<1e-12, y=0.5*ones(size(x));
+else, y=(x-xmin)/(xmax-xmin);
+end
+y=min(max(y,0),1);
+end
+
+function [gain,perUAVPower,phi]=optimizeRISChannel(H,G,HRU,P)
+% Channel-dependent, toolbox-free RIS phase optimization.
+%
+% H   : direct UAV-user small-scale channel, NUAV x NUSER
+% G   : BS-RIS channel, NRIS x 1
+% HRU : RIS-UAV-user channel, NUAV x NRIS x NUSER
+%
+% A 2-bit quantized RIS phase vector is optimized by coordinate updates.
+% The objective explicitly depends on the cascaded BS-RIS-UAV/user channel.
+% This is a lightweight multi-user RIS model, not a full beamforming solver.
+
+NUAV=size(H,1); NUSER=size(H,2); NRIS=size(HRU,2);
+levels=P.risCandidatePhases(:).';
+
+% Cascaded coefficient for each RIS element, aggregated over users/UAVs.
+C=zeros(NRIS,1);
+for k=1:NRIS
+    C(k)=G(k)*sum(sum(squeeze(HRU(:,k,:))));
+end
+C=C/(sqrt(mean(abs(C).^2))+eps);
+
+% Quantized phase initialization aligns the dominant cascaded coefficients.
+phi=quantizePhase(mod(-angle(C),2*pi),levels);
+
+idx=1:min(P.risOptimizeElements,NRIS);
+for it=1:P.risCoordinateIterations
+    for kk=1:numel(idx)
+        k=idx(kk);
+        bestPhi=phi(k);
+        bestObj=risObjective(phi,H,G,HRU,P);
+        oldPhi=phi(k);
+        for c=1:numel(levels)
+            phi(k)=levels(c);
+            obj=risObjective(phi,H,G,HRU,P);
+            if obj>bestObj
+                bestObj=obj;
+                bestPhi=levels(c);
+            end
+        end
+        phi(k)=bestPhi;
+        if ~isfinite(bestObj), phi(k)=oldPhi; end
+    end
+end
+
+% Per-UAV received power after the optimized RIS phases.
+v=G(:).*exp(1j*phi(:));
+perUAVPower=zeros(NUAV,1);
+for i=1:NUAV
+    HR=squeeze(HRU(i,:,:)); % NRIS x NUSER
+    casc=v.'*HR;             % 1 x NUSER, no conjugation on v
+    field=P.risDirectWeight*H(i,:)+P.risPathScale*casc;
+    perUAVPower(i)=mean(abs(field).^2);
+end
+
+basePower=mean(abs(H(:)).^2)+eps;
+gain=min(1,max(0,mean(perUAVPower)/(basePower+eps)));
+gain=0.65+0.35*gain;
+end
+
+function obj=risObjective(phi,H,G,HRU,P)
+% Vectorized average received-power objective for the cascaded RIS channel.
+NUAV=size(H,1); NUSER=size(H,2);
+v=G(:).*exp(1j*phi(:));
+acc=0;
+for i=1:NUAV
+    HR=squeeze(HRU(i,:,:)); % NRIS x NUSER
+    casc=v.'*HR;
+    field=P.risDirectWeight*H(i,:)+P.risPathScale*casc;
+    acc=acc+sum(abs(field).^2);
+end
+obj=acc/(NUAV*NUSER);
+end
+
+function q=quantizePhase(phi,levels)
+q=zeros(size(phi));
+for k=1:numel(phi)
+    d=abs(angle(exp(1j*(phi(k)-levels))));
+    [~,idx]=min(d);
+    q(k)=levels(idx);
+end
+end
